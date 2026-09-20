@@ -4,13 +4,26 @@
 
 ---
 
-## 0. TL;DR
+## 0. 部署卡片与 TL;DR
 
-1. **是什么**：vLLM V1 把引擎从「单进程大对象」拆成**前端进程（Frontend）** + **核心进程（EngineCore）**两个角色，中间用 ZMQ + msgpack 通信。
-2. **解决什么**：V0 里 tokenize / detokenize / API 序列化这类纯 CPU 的 Python 工作和 GPU 调度循环挤在同一个 Python 解释器里抢 GIL，导致小模型上 CPU 开销成为瓶颈；同时所有 feature（前缀缓存、spec decode、LoRA、结构化输出、KV 传输）都长在同一个 `LLMEngine` 对象上，耦合严重。
-3. **怎么做**：`EngineCore`（[vllm/v1/engine/core.py:105](../vllm/v1/engine/core.py#L105)）只负责「调度 + 执行」，跑在自己的进程里跑 busy loop；tokenize / detokenize / 输出聚合 / OpenAI 协议这些留在前端；两者通过 `EngineCoreClient`（[vllm/v1/engine/core_client.py:79](../vllm/v1/engine/core_client.py#L79)）收发 `EngineCoreRequest` / `EngineCoreOutputs`。
-4. **怎么做得更快**：EngineCore 内部又用**两个后台 IO 线程 + 两个 queue** 把 ZMQ 收发从 busy loop 里剥离出去（[vllm/v1/engine/core.py:1103](../vllm/v1/engine/core.py#L1103) 的注释写得很直白："These enable us to overlap ZMQ socket IO with GPU since they release the GIL"）。
-5. **收益**：GIL 隔离让「CPU 侧调度」和「GPU 侧执行」真正并行；进程边界天然支持多 EngineCore 数据并行（DP）与多 API server 前端横向扩展。
+### 0.1 部署卡片
+
+| 项目 | 内容 |
+| --- | --- |
+| **怎么开** | V1 是当前默认引擎（旧版需 `VLLM_USE_V1=1`）。前端进程数：`--api-server-count N`；执行器：`--distributed-executor-backend mp`（默认）/ `ray` / `uni` |
+| **怎么确认生效** | 启动后能看到独立的 `EngineCore` 进程（`ps -ef \| grep EngineCore`）；日志里出现 `EngineCore proc ... ready` |
+| **症状 → 调什么** | ① 小模型上 GPU 利用率上不去、CPU 核打满 → 前端是瓶颈，加 `--api-server-count`；② 单步调度开销占比高 → 开 `--async-scheduling`（见 `05`）；③ 单步尾延迟抖动 → 看 `05` 的抢占指标 |
+| **一条命令试** | `vllm serve Qwen/Qwen2.5-7B-Instruct --api-server-count 2` |
+
+> 前端进程负责 HTTP / tokenize / detokenize，EngineCore 进程负责调度与执行。**你在日志里看到的两段输出来自两个进程**，排查问题时别只盯一个。
+
+### 0.2 五句话 TL;DR
+
+1. **是什么**：vLLM V1 把引擎拆成**前端进程** + **EngineCore 进程**两个角色，中间用 ZMQ + msgpack 通信。
+2. **解决什么**：Python 的全局解释器锁（GIL）让 tokenize / detokenize 这类 CPU 活和 GPU 调度循环抢同一把锁；小模型单步只有几毫秒，Python 开销能占一半，GPU 在干等 CPU。
+3. **怎么做**：前端把 prompt 转成 token id 后发 `EngineCoreRequest`；EngineCore 在自己的进程里跑 busy loop 做 `schedule()` → `execute_model()`；结果按增量 token 回传前端。
+4. **收益**：前后处理的卡顿不再推迟调度；进程边界天然支持多副本（DP）和多 API server 横向扩展。
+5. **代价**：每步多一次序列化 / 反序列化；跨进程调试比单进程难。
 
 ---
 
@@ -701,7 +714,9 @@ EngineCore 收到的 `sampling_params.max_tokens` 永远是非空的 —— 契�
 
 ---
 
-## 6. 面试高频问题
+## 6. 面试高频问题（速查，理解原理可跳过）
+
+> 这一节是面试向的 Q&A 速查，答案大多是正文的压缩版。**如果目标是理解系统或排查线上问题，读完 §1~§5 就够了**，不必逐题记忆。
 
 **Q1：V1 为什么要拆两个进程？拆的边界画在哪里？**
 边界画在「协议/文本处理」与「调度/执行」之间。前端（`AsyncLLM` / `LLMEngine`）持有 tokenizer、renderer、detokenizer、OutputProcessor；EngineCore（[core.py:105](../vllm/v1/engine/core.py#L105)）只持有 Scheduler + Executor。核心动机是 GIL 隔离：V0 里 detokenize 这类 Python 重活会推迟下一步调度，导致 GPU 空转。前端输入是 `EngineCoreRequest`（含 token id），输出是 `EngineCoreOutput`（含增量 token id），中间用 ZMQ + msgpack。

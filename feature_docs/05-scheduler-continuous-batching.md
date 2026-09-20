@@ -1,13 +1,25 @@
 # V1 调度器：Continuous Batching、Chunked Prefill、抢占与异步调度
 
-## 0. TL;DR
+## 0. 部署卡片与 TL;DR
 
-- vLLM V1 没有"prefill 阶段 / decode 阶段"的概念。`Scheduler.schedule()` 每个 step 只做一件事：让每个请求的 `num_computed_tokens` 追上它的 `num_tokens_with_spec`，追不上就分几次追（chunked prefill），追上了就停止。见 [vllm/v1/core/sched/scheduler.py:565](../vllm/v1/core/sched/scheduler.py#L565) 的 `NOTE(woosuk)`。
-- 一个 step 的调度分两段：先遍历 `self.running`（已有请求的 decode + 未完成的 prefill chunk），再遍历 `waiting`/`skipped_waiting`（新请求与被抢占请求）。[scheduler.py:612](../vllm/v1/core/sched/scheduler.py#L612) 与 [scheduler.py:847](../vllm/v1/core/sched/scheduler.py#L847)。
-- 硬约束只有三个：`token_budget`（= `max_num_scheduled_tokens`，默认等于 `max_num_batched_tokens=2048`）、`max_num_running_reqs`（= `max_num_seqs=128`）、KV block 池空闲块数。三者任一不满足就停止准入或触发抢占。
-- Chunked prefill 由 `enable_chunked_prefill`（默认 True）+ `max_num_batched_tokens` 自然实现：`num_new_tokens = min(需要量, 剩余 budget)`；`long_prefill_token_threshold` 是额外的单请求每步上限（默认 0，即不限制）。
-- V1 **只支持 RECOMPUTE 式抢占**：`_preempt_request()` 直接 `num_computed_tokens = 0` + 释放全部 block + `waiting.prepend_request()`。全仓库 `vllm/v1/` 下不存在 `PreemptionMode`/`swap_out`/`SWAP` 语义（已实际搜索确认），SWAP 是 V0 遗留概念。
-- `AsyncScheduler` 通过"输出占位符"（`num_output_placeholders`）让调度器在 GPU 还在跑第 N 步时就按预测状态调度第 N+1 步，从而把 Python 调度开销隐藏在 GPU 执行里；收到真实输出后再做 correction。
+### 0.1 部署卡片
+
+| 项目 | 内容 |
+| --- | --- |
+| **怎么开** | `--max-num-batched-tokens 2048`（默认 2048，单步总 token 上限）、`--max-num-seqs 128`（默认，并发请求上限）、`--long-prefill-token-threshold 0`（默认不限）、`--scheduling-policy fcfs\|priority`、异步调度 `--async-scheduling`（默认自动判断） |
+| **怎么确认生效** | 日志每 30s 一行 `Avg generation throughput: X tokens/s, Running: N reqs, Waiting: M reqs`；Prometheus 看 `vllm:num_requests_running` / `vllm:num_requests_waiting` / `vllm:kv_cache_usage_perc` / `vllm:num_preemptions` |
+| **症状 → 调什么** | ① `vllm:num_preemptions` 一直涨 → KV 打满：降 `--max-num-seqs`，或加 `--watermark 0.02` 预留空闲块；② 每 token 延迟（TPOT）抖动大 → 调小 `--max-num-batched-tokens`，或设 `--long-prefill-token-threshold 2048`；③ 吞吐上不去但 `kv_cache_usage_perc` 很低 → `--max-num-seqs` 太小，KV 根本没用满；④ 小模型 GPU 空转 → 开 `--async-scheduling` |
+| **一条命令试** | `vllm serve Qwen/Qwen2.5-7B-Instruct --max-num-batched-tokens 8192 --long-prefill-token-threshold 2048`，压测时盯 `vllm:num_preemptions` 是否回到 0 |
+
+> 三个数字决定调度行为：**单步 token 预算**（`max_num_batched_tokens`）、**并发请求上限**（`max_num_seqs`）、**KV 块够不够**。调参时三个必须一起看，只看一个必然误判。
+
+### 0.2 五句话 TL;DR
+
+1. **是什么**：每个 step 重新组批（continuous batching），长 prompt 切成多步完成（chunked prefill），显存不够时抢占并从头重算。
+2. **解决什么**：静态批必须等最慢的请求才释放资源，GPU 利用率常只有 30%~50%；长 prompt 一次算完会卡住所有 decode 请求，还可能 activation OOM。
+3. **怎么做**：只维护一个不变量——让每个请求的「已算 token 数」追上「应算 token 数」，每步给每个请求分配 `min(还需要的, 剩余预算)`，剩下的下一步再追。
+4. **收益**：请求随到随处理、随完随退出；activation 峰值被 `max_num_batched_tokens` 钉住，不会因为一个超长 prompt 就爆显存。
+5. **代价**：每步都要跑一遍 Python 调度（小模型上这会成为新瓶颈，于是有异步调度）；长 prompt 的 TTFT 被拉长。
 
 ---
 
@@ -72,74 +84,47 @@ WAITING_FOR_STREAMING_REQ  ── 阻塞态，放 skipped_waiting 队列
 
 注意 `is_finished()` 的实现是 `status > RequestStatus.PREEMPTED`（[request.py:386](../vllm/v1/request.py#L386)），所以 `PREEMPTED` 是一个"可复活"的中间态，而非终止态。
 
-### 2.3 调度主循环流程图
+### 2.3 调度主循环：先看主干
+
+一个 step 的主干只有 4 步（分支条件单独列在下表）：
 
 ```
-              EngineCoreProc.step()   —— 每个 engine step 调用一次
-                          |
-                          v
-        +--------------------------------------------+
-        |  Scheduler.schedule(throttle_prefills)     |
-        +--------------------------------------------+
-                          |
-   (0) current_step += 1
-       kv_cache_manager.new_step_starts()
-                          |
-   (1) token_budget = max_num_scheduled_tokens          # 逻辑 token 预算
-       input_budget = max_num_batched_tokens            # 物理输入槽位预算
-       draft_slots  = spec.max_num_new_slots_for_drafting
-                          |
-                          v
-   (2) ==== 阶段 A：遍历 self.running（decode + 未完成 chunk）====
-       while req_index < len(running) and token_budget > 0:
-          |-- input_budget <= draft_slots?                 -> break
-          |-- 已达 max_tokens（异步调度保护）?               -> continue
-          |-- current_step < next_decode_eligible_step?     -> continue
-          |-- defer_prefills and is_prefill_chunk?          -> continue
-          |-- ec_connector 未就绪?                          -> continue
-          |
-          num_new_tokens = min(need,
-                               long_prefill_token_threshold (若>0),
-                               token_budget,
-                               input_budget - draft_slots,
-                               max_model_len 余量)
-          |-- mamba 对齐裁剪 -> encoder 预算裁剪 -> MTP lookahead 裁剪
-          |-- num_new_tokens == 0 ?                        -> continue
-          |
-          allocate_slots() == None ?  ──yes──> 选 victim 抢占
-          |                                    （FCFS: running.pop()
-          |                                     PRIORITY: max(priority, arrival)）
-          |                                    回滚 victim 已扣预算，重试
-          no
-          |
-          记账：scheduled_running_reqs / req_to_new_blocks /
-                num_scheduled_tokens / token_budget -= n / input_budget -= n + draft_slots
-                          |
-                          v
-   (3) ==== 阶段 B：waiting / skipped_waiting（新请求 + 被抢占请求）====
-       if not preempted_reqs and pause_state == UNPAUSED:
-         while (waiting or skipped_waiting) and token_budget > 0:
-           |-- len(running) + num_waiting_for_streaming >= max_num_seqs -> break
-           |-- 阻塞态 / 有 stale output / LoRA 超配额 -> 移入 skipped_waiting, continue
-           |-- prefix cache 查询：num_new_local_computed_tokens
-           |-- connector：num_external_computed_tokens（可能走 async load）
-           |-- num_new_tokens = num_tokens - num_computed_tokens
-           |-- long_prefill_threshold / enable_chunked_prefill / budget 三重裁剪
-           |-- allocate_slots() == None ?  -> encoder_cache_manager.free(request); break
-           |-- 出队 -> running.append(); status = RUNNING;
-               num_computed_tokens = num_computed_tokens
-                          |
-                          v
-   (4) 断言（total <= max_num_scheduled_tokens / len(running) <= max_num_seqs）
-       num_common_prefix_blocks（cascade attention）
-       组装 SchedulerOutput
-       _update_after_schedule(): num_computed_tokens += n; num_in_flight_tokens += n
-                          |
-                          v
-              executor.execute_model(...)  ──GPU──>  update_from_output()
-                                                            |
-                                                    回到 (0)，下一个 step
+EngineCore.step()
+   │
+   ├─(1) 初始化预算
+   │     token_budget = max_num_scheduled_tokens    # 本步能签发多少 token
+   │     input_budget = max_num_batched_tokens      # 模型能接收多少输入槽位
+   │
+   ├─(2) 阶段 A：先喂已经在跑的请求          self.running
+   │     每个请求分到 min(还需要的, 剩余预算) 个 token
+   │     KV 块不够 -> 抢占一个 victim 让它从头重算
+   │
+   ├─(3) 阶段 B：用剩余预算准入新请求        waiting / skipped_waiting
+   │     查前缀缓存 -> 算要几个 token -> 分配 KV 块 -> 进 running
+   │
+   └─(4) 组装 SchedulerOutput -> 交给 executor 执行
+         核心字段 num_scheduled_tokens: {req_id: 本步算几个 token}
 ```
+
+**这个顺序就是"decode 优先"**：已在跑的请求先拿预算，剩下的才轮到新请求。
+
+两个阶段各自会在什么情况下跳过某个请求：
+
+| 阶段 | 跳过条件 | 原因 |
+| --- | --- | --- |
+| A | `input_budget <= draft_slots` | 物理输入槽位不够（含投机解码的草稿位） |
+| A | 已达 `max_tokens`（异步调度保护） | 预测下一步已到上限，别多调度一次 |
+| A | `current_step < next_decode_eligible_step` | V2 + PP + 异步下强制同请求 decode 间隔 |
+| A | `defer_prefills and is_prefill_chunk` | DP 对齐：非节奏步推迟 prefill |
+| A | ec_connector 未就绪 | 等外部数据 |
+| A | `num_new_tokens == 0` | 这个请求本步没什么可算 |
+| A | `allocate_slots` 失败且没有 victim 可抢 | **break**，退出整个 running 循环 |
+| B | 本 step 已发生过抢占 | 防止"抢占 → 准入 → 再抢占"震荡 |
+| B | `len(running) + streaming >= max_num_seqs` | 并发上限 |
+| B | 阻塞态 / 有 stale output / LoRA 超配额 | 移入 `skipped_waiting`，下个 step 再看 |
+| B | `allocate_slots` 失败 | **break**，并撤销 encoder cache 的触碰 |
+
+> 逐步对应的源码见 §3.3（阶段 A）与 §3.5（阶段 B），抢占细节见 §3.4 与 §3.8。
 
 ### 2.4 一个 step 的 batch 组成图
 
@@ -1191,7 +1176,9 @@ Prometheus 暴露（[vllm/v1/metrics/loggers.py:1118-1133](../vllm/v1/metrics/lo
 
 ---
 
-## 6. 面试高频问题
+## 6. 面试高频问题（速查，理解原理可跳过）
+
+> 这一节是面试向的 Q&A 速查，答案大多是正文的压缩版。**如果目标是理解系统或排查线上问题，读完 §1~§5 就够了**，不必逐题记忆。
 
 **Q1：Continuous batching 和 static/request-level batching 的本质区别是什么？**
 A：Static batching 在**请求级**组批，一批请求必须一起结束才释放资源；continuous batching 在**迭代级（每个 forward step）** 组批，每个 step 重新决定哪些请求参与、各算几个 token。vLLM V1 的实现里没有"prefill 阶段/decode 阶段"的概念，只有一个不变量：让每个请求的 `num_computed_tokens` 追上 `num_tokens_with_spec`。见 [scheduler.py:565](../vllm/v1/core/sched/scheduler.py#L565) 的 `NOTE(woosuk)`。请求结束立即从 `self.running` 移除并被 `_free_request` 释放 block（[scheduler.py:2566](../vllm/v1/core/sched/scheduler.py#L2566)），空出的 slot 下一个 step 就能给新请求。

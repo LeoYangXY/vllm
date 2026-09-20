@@ -2,7 +2,20 @@
 
 > 适用版本：vLLM V1。配置在 `vllm/config/parallel.py`，进程组在 `vllm/distributed/parallel_state.py`，执行器在 `vllm/v1/executor/`，Worker 在 `vllm/v1/worker/`。
 
-## 0. TL;DR
+## 0. 部署卡片与 TL;DR
+
+### 0.1 部署卡片
+
+| 项目 | 内容 |
+| --- | --- |
+| **怎么开** | 单机多卡 `--tensor-parallel-size N`；跨机 `--pipeline-parallel-size N`（配合 `--distributed-executor-backend ray`）；提吞吐 `--data-parallel-size N`；MoE 加 `--enable-expert-parallel` |
+| **怎么确认生效** | 日志里 `world_size=N`、每张卡都打印 KV 块数；`nvidia-smi` 上每张卡都有 worker 进程 |
+| **症状 → 调什么** | ① 单卡明明放得下，开了 TP2 延迟反而升高 → 每步两次 all-reduce 的通信开销，改 DP 更划算；② 显存放不下 → 先 TP 到"单卡放得下"，再 DP 提吞吐；③ MoE 吞吐上不去 → `--enable-expert-parallel`；④ 多机 → `--distributed-executor-backend ray` |
+| **一条命令试** | `vllm serve Qwen/Qwen2.5-7B-Instruct --tensor-parallel-size 2`，对比 TP1 的单请求延迟与并发吞吐 |
+
+> 选型口诀：**TP 降延迟（切得动就切，但通信有代价）、PP 跨机、EP 服务 MoE、DP 提吞吐**。DP 不降低单请求延迟，这点常被误解。
+
+### 0.2 五句话 TL;DR
 
 - **是什么**：把模型/请求切到多卡/多机，四种并行——TP（张量）、PP（流水线）、EP（专家，MoE）、DP（数据）。
 - **解决什么**：单卡放不下大模型（TP/PP）、MoE 专家太多（EP）、要提高吞吐（DP）。
@@ -143,7 +156,9 @@ EngineCore.step -> scheduler.schedule -> executor.execute_model(scheduler_output
 
 ---
 
-## 6. 面试高频问题
+## 6. 面试高频问题（速查，理解原理可跳过）
+
+> 这一节是面试向的 Q&A 速查，答案大多是正文的压缩版。**如果目标是理解系统或排查线上问题，读完 §1~§5 就够了**，不必逐题记忆。
 
 **Q1：TP 和 PP 怎么选？**
 A：TP 降单请求延迟但通信密集（适合同机 NVLink）；PP 跨节点、气泡大，适合单卡放不下且跨机（[config/parallel.py:119](../vllm/config/parallel.py#L119)）。

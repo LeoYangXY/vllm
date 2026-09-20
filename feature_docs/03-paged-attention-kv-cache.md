@@ -4,13 +4,26 @@
 
 ---
 
-## 0. TL;DR
+## 0. 部署卡片与 TL;DR
 
-1. **是什么**：把 KV cache 切成固定大小（`block_size`，默认 16 token）的 **block**，请求按需从全局 `BlockPool` 申请 block，逻辑上连续、物理上离散，用一张 **block table** 记录 `token 位置 → 物理 slot` 的映射。
-2. **解决什么**：消除「按 `max_model_len` 预留连续显存」带来的内部碎片、外部碎片，并让**相同前缀的 block 可以被多个请求共享**（引用计数 + hash），这是 prefix caching 与 KV 复用的物理基础。
-3. **怎么做**：`KVCacheSpec`（每层怎么存）→ `KVCacheGroupSpec`（哪些层共享 block table）→ `KVCacheConfig` + `KVCacheTensor`（一个扁平字节池的 stride 描述）→ `BlockPool` / `SingleTypeKVCacheManager` / `KVCacheCoordinator`（调度侧分配）→ `BlockTable` + `slot_mapping`（worker 侧索引）→ attention kernel。
-4. **收益**：显存几乎零碎片（`BlockPool.get_usage()` 即真实占用率），系统吞吐随空闲 block 数线性增长；`num_blocks = available_memory // bytes_per_block`，`bytes_per_block` 由 spec 精确算出，不留余量。
-5. **代价**：kernel 必须通过 block table 间接寻址（slot mapping 多一次 gather）；block 粒度带来尾部内部碎片（平均 `block_size/2` token/请求）；SWA / Mamba 这类「非全量保留」的注意力需要额外的 block 回收与 null block 填充逻辑。
+### 0.1 部署卡片
+
+| 项目 | 内容 |
+| --- | --- |
+| **怎么开** | `--block-size 16`（默认 16，常用 8/16/32）；显存占比 `--gpu-memory-utilization 0.9`（默认 0.9）；想手工控制块数用 `--num-gpu-blocks-override N` |
+| **怎么确认生效** | 启动日志里有一行 `GPU KV cache size: NNNNNN tokens`（N 就是可用 token 总量）；运行中看指标 `vllm:kv_cache_usage_perc` |
+| **症状 → 调什么** | ① `kv_cache_usage_perc` 长期 < 0.5 而 `num_requests_waiting` 很高 → 并发上限卡在 `max_num_seqs`，去调 `05`；② usage 长期 > 0.95 → 频繁抢占，降 `max_num_seqs` 或加 `--watermark 0.02`；③ 显存够但 KV 块太少 → 调大 `--gpu-memory-utilization` |
+| **一条命令试** | `vllm serve Qwen/Qwen2.5-7B-Instruct --block-size 16 --gpu-memory-utilization 0.9`（看日志里的 `GPU KV cache size`） |
+
+> 换算直觉：可用 KV 块数 ≈（GPU 显存 × `gpu_memory_utilization` − 权重 − activation）/ 单块字节数。**并发上限不是 `max_num_seqs`，而是"KV 块够不够"**，两个一起看。
+
+### 0.2 五句话 TL;DR
+
+1. **是什么**：KV cache 被切成固定大小的**块**（block，默认 16 token），请求按需从全局块池申请，逻辑上连续、物理上离散，用 block table 记录「token 位置 → 物理槽位」。
+2. **解决什么**：按 `max_model_len` 给每个请求预留连续显存会浪费 60%~80%（vLLM 论文实测），而且相同前缀没法被多个请求共享。
+3. **怎么做**：调度侧只操心块 id（分配 / 释放 / 引用计数 / 内容哈希），worker 侧才把块 id 翻译成 `slot_mapping` 张量喂给 attention kernel。
+4. **收益**：显存碎片接近零，空闲块数直接决定并发上限；相同前缀的块可被多个请求共享（这是前缀缓存的物理基础，见 `04`）。
+5. **代价**：kernel 要通过 block table 间接寻址（多一次 gather）；每个请求平均浪费半个块（`block_size/2` token）。
 
 ---
 
@@ -836,7 +849,9 @@ C_fp8  = (128 + 128) × 1 = 256 B      →  bytes_per_block 减半 → num_block
 
 ---
 
-## 6. 面试高频问题
+## 6. 面试高频问题（速查，理解原理可跳过）
+
+> 这一节是面试向的 Q&A 速查，答案大多是正文的压缩版。**如果目标是理解系统或排查线上问题，读完 §1~§5 就够了**，不必逐题记忆。
 
 **Q1：为什么需要分页 KV cache？连续分配到底浪费在哪？**
 答：三重浪费 —— (a) **预留**：按 `max_model_len` 预留，实际远用不满；(b) **内部碎片**：最后一个分配单元没用满；(c) **外部碎片**：长短请求释放后留下大小不一的空洞。vLLM SOSP'23 论文实测现有系统浪费 60%~80% 显存。分页后 (b) 降到平均 `block_size/2` token/请求，(a)(c) 彻底消失。代码侧对应：`num_blocks = available_memory // bytes_per_block`（[kv_cache_utils.py:1710](../vllm/v1/core/kv_cache_utils.py#L1710)），没有任何预留系数。

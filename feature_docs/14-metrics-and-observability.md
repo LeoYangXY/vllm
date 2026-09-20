@@ -1,13 +1,28 @@
-# Metrics 与可观测性
+# Metrics 与可观测性（问题定位手册）
 
 > 适用版本：vLLM V1。实现在 `vllm/v1/metrics/`（`loggers.py` / `stats.py` / `prometheus.py`）。
+> 本文的落地目标是：**给你一套"现象 → 看哪个指标 → 调哪个参数"的对照表**，源码细节只讲必要的部分。
 
-## 0. TL;DR
+## 0. 部署卡片与 TL;DR
 
-- **是什么**：V1 在 EngineCore 进程收集调度/执行统计，回前端进程后由 `StatLoggerBase` 派生类落日志或暴露 Prometheus 指标。
-- **解决什么**：线上要回答「该不该扩容」「为什么尾延迟高」「KV cache 是不是瓶颈」「prefix 命中率够不够」，没有指标就是盲调。
-- **怎么做**：`SchedulerStats` / `EngineCoreMetrics` 随 `EngineCoreOutput` 每步回传 → `OutputProcessor`/`LoggingStatLogger`/`PrometheusStatLogger` 聚合 → 日志 or `/metrics` 端点。
-- **收益**：可量化容量规划、SLO 治理、问题定位（排队 / 显存 / 命中率 / GPU 空转）。
+### 0.1 部署卡片
+
+| 项目 | 内容 |
+| --- | --- |
+| **怎么开** | 周期日志**默认开启**，关掉用 `--disable-log-stats`；Prometheus 指标默认挂在 API server 的 `/metrics`；链路追踪用 `--otlp-traces-endpoint http://...:4318` |
+| **怎么确认生效** | 启动后每 30s 会打印一行 `Avg prompt throughput: ..., Running: N reqs, ...`；`curl http://localhost:8000/metrics \| grep vllm:` 能看到全部指标 |
+| **症状 → 调什么** | 直接跳到本文 §4「诊断对照表」，按现象查 |
+| **一条命令试** | `curl -s http://localhost:8000/metrics \| grep -E 'vllm:(num_requests\|kv_cache_usage\|prefix_cache_hits\|num_preemptions)'` |
+
+> 三个最常见的误读：① **没有直接的"命中率"指标**，要用 `hits / queries` 自己算；② `request_time_per_output_token_seconds` 是「端到端延迟 ÷ 输出 token 数」的近似口径，想看真正的逐 token 间隔要看 `inter_token_latency_seconds`；③ 日志那行里的 `Waiting` 是 `waiting + skipped_waiting` 的和。
+
+### 0.2 五句话 TL;DR
+
+1. **是什么**：EngineCore 每步产出调度/执行统计，随输出回传前端，由日志 logger 和 Prometheus logger 分别落盘与暴露。
+2. **解决什么**：线上要回答"该不该扩容""为什么尾延迟高""KV 是不是瓶颈""前缀缓存有没有生效"，没有指标就只能拍脑袋。
+3. **怎么做**：`SchedulerStats` 随 `EngineCoreOutputs` 回传 → 前端 `OutputProcessor` 与 logger 聚合 → 日志行或 `/metrics`。
+4. **收益**：容量规划、SLO 治理、问题定位都有量化依据，而且 vLLM 自带了**延迟分解**指标（排队 / prefill / decode 分开统计）。
+5. **代价**：指标有采样与聚合开销（很小）；多副本/DP 下要按副本聚合，单副本数字不代表全局。
 
 ---
 
@@ -15,142 +30,207 @@
 
 生产部署必须可观测，否则只能拍脑袋。典型问题：
 
-- **排队**：`num_requests_waiting` 持续高 → 吞吐不够 / 并发上限低。
-- **显存瓶颈**：`gpu_cache_usage_perc` 接近 1 → 触发抢占，尾延迟飙升。
-- **prefix 失效**：`gpu_prefix_cache_hit_rate` 低 → 重复算 prefill，TTFT 高。
-- **GPU 空转**：`iteration_tokens_total` 低、`num_requests_running` 小 → batch 太小，decode 阶段 GPU 利用率低（该上 spec decode / cudagraph）。
-- **TTFT / TPOT**：直接反映用户体验的 SLO 指标。
+| 想回答的问题 | 靠什么指标 |
+| --- | --- |
+| 该不该扩容了？ | `vllm:num_requests_waiting` 持续高 + `vllm:kv_cache_usage_perc` 接近 1 |
+| 为什么尾延迟高？ | `vllm:request_queue_time_seconds`（排队）vs `vllm:request_prefill_time_seconds`（算得慢） |
+| KV cache 是不是瓶颈？ | `vllm:kv_cache_usage_perc`、`vllm:num_preemptions` |
+| 前缀缓存生效了吗？ | `vllm:prefix_cache_hits / vllm:prefix_cache_queries` |
+| GPU 是不是在空转？ | `vllm:num_requests_running` 小 + `vllm:iteration_tokens_total` 低 |
 
 ---
 
-## 2. 核心设计
-
-### 2.1 指标数据从哪来
+## 2. 指标是怎么流出来的
 
 ```
 Worker/GPU ── ModelRunnerOutput ──> EngineCore.step()
         │
-        ├─ SchedulerStats (调度侧: waiting/running/cache 使用/命中率)
-        ├─ EngineCoreMetrics (核心侧: 迭代吞吐/调度耗时)
-        └─ 打包进 EngineCoreOutput ── ZMQ ──> 前端
+        ├─ SchedulerStats        (调度侧: running/waiting/KV 使用率/前缀命中)
+        ├─ EngineCoreMetrics     (核心侧: 迭代 token 数/调度耗时)
+        └─ 打包进 EngineCoreOutputs ── ZMQ ──> 前端
                         │
                         ▼
         StatLoggerBase 派生: LoggingStatLogger / PrometheusStatLogger
 ```
 
-### 2.2 三种 Logger
+三种 logger（[vllm/v1/metrics/loggers.py](../vllm/v1/metrics/loggers.py)）：
 
-```python
-# vllm/v1/metrics/loggers.py:44
-class StatLoggerBase(ABC):           # 抽象基类，定义 log/info 接口
-
-# vllm/v1/metrics/loggers.py:99
-class LoggingStatLogger(StatLoggerBase):     # 周期性打印到日志（Avg generation throughput 等）
-
-# vllm/v1/metrics/loggers.py:443
-class PrometheusStatLogger(AggregateStatLoggerBase):  # 暴露 Prometheus gauge/counter
-```
-
-- `LoggingStatLogger`：每个 `log_interval`（默认 30s）打一行汇总（running/waiting 数、GPU 吞吐、前缀命中率、调度延迟等）。
-- `PrometheusStatLogger`：把指标注册成 Prometheus collector，由 `/metrics` 端点抓取。
-
-### 2.3 核心统计结构
-
-```python
-# vllm/v1/metrics/stats.py:186
-class SchedulerStats:
-    # num_running_reqs / num_waiting_reqs
-    # gpu_cache_usage_sys / cpu_cache_usage_sys
-    # prefix_cache_stats (命中率相关)
-    # 各 finish reason 计数
-```
-
-`EngineCoreMetrics` 含每步迭代的 token 数、调度耗时、队列长度等，用于计算吞吐与延迟分位。
+| 类 | 位置 | 作用 |
+| --- | --- | --- |
+| `StatLoggerBase` | [loggers.py:44](../vllm/v1/metrics/loggers.py#L44) | 抽象基类，定义 `log` / `info` 接口 |
+| `LoggingStatLogger` | [loggers.py:99](../vllm/v1/metrics/loggers.py#L99) | 每 30s 打一行汇总日志 |
+| `PrometheusStatLogger` | [loggers.py:443](../vllm/v1/metrics/loggers.py#L443) | 注册 Prometheus collector，由 `/metrics` 抓取 |
 
 ---
 
-## 3. 代码走读
+## 3. 先学会看那一行日志
 
-### 3.1 指标随 output 回传
+这是**最快的上手方式**——不用配 Prometheus，启动就有。格式（[loggers.py:256-313](../vllm/v1/metrics/loggers.py#L256)）：
 
-EngineCore 在 `step` 把 `SchedulerStats` 和 `EngineCoreMetrics` 塞进 `EngineCoreOutput`，经 ZMQ 回前端（见 `02` 的通信链路）。前端 `OutputProcessor` 把数据喂给配置的 logger。
+```text
+Avg prompt throughput: 1234.5 tokens/s, Avg generation throughput: 567.8 tokens/s,
+Running: 32 reqs, Waiting: 8 reqs, GPU KV cache usage: 67.3%, Prefix cache hit rate: 43.2%
+```
 
-### 3.2 Prometheus 端点
+逐项拆解：
 
-`PrometheusStatLogger` 在 `vllm/entrypoints/metrics.py`（或 API server 启动时）注册 `/metrics` 路由，Prometheus 周期抓取。常见指标名（以实际代码为准）：`vllm:num_requests_running`、`vllm:num_requests_waiting`、`vllm:gpu_cache_usage_perc`、`vllm:gpu_prefix_cache_hit_rate`、`vllm:time_to_first_token_seconds`、`vllm:time_per_output_token_seconds`、`vllm:e2e_request_latency_seconds`、`vllm:request_success_total`、`vllm:iteration_tokens_total`。
+| 字段 | 含义 | 怎么用 |
+| --- | --- | --- |
+| `Avg prompt throughput` | 窗口内 **prefill** token 吞吐 | 高说明在处理大量长 prompt |
+| `Avg generation throughput` | 窗口内 **decode** 输出 token 吞吐 | 这是通常说的"系统吞吐" |
+| `Running: N reqs` | 当前在跑的请求数 | 远小于 `max_num_seqs` → 并发没打满 |
+| `Waiting: M reqs` | 排队请求数（含被推迟的） | 持续 > 0 → 容量不足 |
+| `Deferred: D reqs` | 被瞬时约束推迟的请求（仅在 >0 时打印） | 见 `05` 的 `skipped_waiting` |
+| `Preemptions: P` | 本窗口累计抢占次数（仅在 >0 时打印） | **一出现就该调优** |
+| `GPU KV cache usage` | KV 块占用率 | 接近 100% → 抢占与尾延迟 |
+| `Prefix cache hit rate` | 前缀缓存命中率 | 见 `04` |
 
-### 3.3 吞吐与延迟的计算口径
-
-- **Avg generation throughput (tok/s)** = 窗口内 completion tokens / 窗口时长。
-- **TTFT**：从请求进入到第一个 output token 的耗时（含排队）。
-- **TPOT（time per output token）**：注意 V1 的 `time_per_output_token_seconds` 实际是「e2e 延迟 / 输出 token 数」的近似口径，并非严格的逐 token 间隔，面试/看板时要明确其口径，避免误读成纯 decode 间隔。
-- **prefix cache hit rate**：命中前缀 block 数 / 总前缀 block 数（见 `04`）。
+> 注意最后两项是**窗口内的平均值**，不是瞬时值。看瞬时值要去 `/metrics` 的 `vllm:kv_cache_usage_perc`。
 
 ---
 
-## 4. 关键数据结构
+## 4. 指标速查表
+
+### 4.1 容量与排队
+
+| 指标 | 含义 |
+| --- | --- |
+| `vllm:num_requests_running` | 正在被调度的请求数 |
+| `vllm:num_requests_waiting` | 排队（waiting + skipped_waiting） |
+| `vllm:num_requests_waiting_by_reason` | 按原因拆分：`capacity`（真排队）vs `deferred`（被瞬时约束推迟） |
+| `vllm:kv_cache_usage_perc` | KV 块占用率 |
+| `vllm:num_preemptions` | 累计抢占次数 |
+| `vllm:request_num_preemptions` | 单请求被抢占次数直方图 |
+
+### 4.2 延迟分解（最有诊断价值的一组）
+
+| 指标 | 含义 |
+| --- | --- |
+| `vllm:time_to_first_token_seconds` | TTFT：进来到第一个 token |
+| `vllm:inter_token_latency_seconds` | ITL：逐 token 间隔（**真正的"卡不卡"**） |
+| `vllm:request_time_per_output_token_seconds` | 近似 TPOT = 端到端延迟 ÷ 输出 token 数（口径见 §4.5） |
+| `vllm:request_queue_time_seconds` | **排队**耗时 |
+| `vllm:request_prefill_time_seconds` | **prefill** 耗时 |
+| `vllm:request_decode_time_seconds` | **decode** 耗时 |
+| `vllm:request_inference_time_seconds` | 推理总耗时（prefill + decode） |
+| `vllm:e2e_request_latency_seconds` | 端到端总延迟（含排队） |
+
+有这组指标，就不用再猜"到底是排队慢还是算得慢"了：`queue_time` 大就扩容，`prefill_time` 大就去查前缀命中与切块（`04`/`05`），`decode_time` 大就去查并发与 GPU 空转。
+
+### 4.3 吞吐与 token 计数
+
+| 指标 | 含义 |
+| --- | --- |
+| `vllm:iteration_tokens_total` | 每步调度的 token 总数（**判断 GPU 空转的关键**） |
+| `vllm:prompt_tokens` / `vllm:generation_tokens` | 累计 prefill / decode token 数 |
+| `vllm:prompt_tokens_by_source` | prefill token 的来源拆分 |
+| `vllm:prompt_tokens_cached` | 命中缓存、没实际计算的 prefill token 数 |
+| `vllm:request_prompt_tokens` / `vllm:request_generation_tokens` | 单请求维度直方图 |
+
+`prompt_tokens_cached / prompt_tokens` 就是"前缀缓存实际省了多少计算"，比命中率更直观。
+
+### 4.4 缓存命中
+
+| 指标 | 含义 |
+| --- | --- |
+| `vllm:prefix_cache_queries` / `vllm:prefix_cache_hits` | 本地前缀缓存查询/命中（**命中率 = hits / queries**） |
+| `vllm:external_prefix_cache_queries` / `..._hits` | 外部（KV connector，见 `10`）命中 |
+| `vllm:mm_cache_queries` / `vllm:mm_cache_hits` | 多模态 encoder 缓存（见 `13`） |
+| `vllm:kv_block_lifetime_seconds` / `..._idle_before_evict_seconds` / `..._reuse_gap_seconds` | KV 块的生命周期/空闲/复用间隔（调 LRU 与块数时有用） |
+
+### 4.5 两个容易读错的口径
+
+1. **`request_time_per_output_token_seconds` ≠ 严格 TPOT**。它是「端到端延迟 ÷ 输出 token 数」的近似，把排队时间也摊进去了。想看生成过程的流畅度，看 `vllm:inter_token_latency_seconds`。
+2. **没有现成的命中率指标**。`prefix_cache_hits / prefix_cache_queries` 要自己算（日志里那行已经帮你算好了）。
+
+### 4.6 其他
+
+| 指标 | 含义 |
+| --- | --- |
+| `vllm:request_success` | 按 finish reason 统计的请求数 |
+| `vllm:corrupted_requests` | logits 出现 NaN 的损坏请求（开启 NaN 检测时才有） |
+| `vllm:engine_sleep_state` | 引擎 sleep/wake 状态（见 sleep mode） |
+| `vllm:lora_requests_info` | LoRA 请求信息（见 `12`） |
+| `vllm:spec_decode_num_accepted_tokens_total` / `..._draft_tokens_total` | 投机解码接受情况（见 `07`） |
+
+---
+
+## 5. 诊断对照表（现象 → 看什么 → 调什么）
+
+| 现象 | 先看这几个指标 | 典型结论 | 调什么 |
+| --- | --- | --- | --- |
+| **吞吐上不去** | `num_requests_running` 远小于 `max_num_seqs`，`kv_cache_usage_perc` 很低 | 并发上限没打开，KV 根本没用满 | 调大 `--max-num-seqs`（`05`） |
+| **吞吐上不去** | `num_requests_running` 小、`iteration_tokens_total` 低、GPU 利用率低 | GPU 空转，batch 打不大 | `--async-scheduling`（`05`）、`--max-num-batched-tokens`（`05`） |
+| **吞吐上不去，小 batch 场景** | `iteration_tokens_total` 长期很低 | 每步只算很少 token | 投机解码（`07`）、CUDA Graph（`08`） |
+| **尾延迟（P99）飙升** | `num_preemptions` 持续上涨、`kv_cache_usage_perc` ≈ 1 | KV 打满触发抢占 | 降 `--max-num-seqs`、加 `--watermark`（`05`） |
+| **TTFT 高** | `request_queue_time_seconds` 占大头 | 纯排队，容量不足 | 扩容 / 加 DP 副本（`09`） |
+| **TTFT 高** | queue 小但 `request_prefill_time_seconds` 大，且 prefix 命中率低 | 重复算 prefill | 查前缀一致性（`04`） |
+| **长 prompt 把系统拖慢** | `inter_token_latency_seconds` 的 P99 抖动 | 长 prefill 抢占了单步时间 | `--long-prefill-token-threshold`（`05`） |
+| **前缀缓存没生效** | `prefix_cache_hits / prefix_cache_queries` < 20% | 请求没有真正的公共前缀 | 检查 system prompt 是否逐字一致（`04`） |
+| **多模态请求慢** | `mm_cache_hits / mm_cache_queries` 低 | 同一张图反复编码 | 见 `13` |
+| **输出出现重复片段** | `num_preemptions` > 0 | 抢占后重算（RECOMPUTE） | 见 `05` §5.2 |
+| **多轮对话没变快** | `prompt_tokens_cached` 占 `prompt_tokens` 比例低 | KV 块被 LRU 驱逐了 | 增大 KV 容量（`03`）或降低并发 |
+
+> 判断顺序建议：**先看 `num_requests_running` / `num_requests_waiting`（是不是容量问题）→ 再看 `kv_cache_usage_perc`（是不是显存问题）→ 最后看延迟分解指标（是哪一段慢）**。
+
+---
+
+## 6. 关键数据结构
 
 | 结构 | 字段 | 位置 |
 | --- | --- | --- |
 | `StatLoggerBase` | 抽象 logger 接口 | [loggers.py:44](../vllm/v1/metrics/loggers.py#L44) |
-| `LoggingStatLogger` | 周期日志 | [loggers.py:99](../vllm/v1/metrics/loggers.py#L99) |
-| `PrometheusStatLogger` | Prometheus 指标 | [loggers.py:443](../vllm/v1/metrics/loggers.py#L443) |
-| `SchedulerStats` | waiting/running/cache/命中率 | [stats.py:186](../vllm/v1/metrics/stats.py#L186) |
-| `EngineCoreMetrics` | 每步吞吐/调度耗时 | [vllm/v1/engine/__init__.py](../vllm/v1/engine/__init__.py) |
+| `LoggingStatLogger` | 周期汇总日志（格式见 §3） | [loggers.py:99](../vllm/v1/metrics/loggers.py#L99) |
+| `PrometheusStatLogger` | Prometheus 指标注册与上报 | [loggers.py:443](../vllm/v1/metrics/loggers.py#L443) |
+| `SchedulerStats` | running/waiting/KV 使用率/前缀命中 | [stats.py:186](../vllm/v1/metrics/stats.py#L186) |
+| `SpecDecodingStats` | 投机解码的 draft/accept 计数 | [vllm/v1/spec_decode/metrics.py](../vllm/v1/spec_decode/metrics.py) |
+
+指标名的完整清单以 [loggers.py](../vllm/v1/metrics/loggers.py) 中的 `name="vllm:..."` 为准——本文表格是常用子集。
 
 ---
 
-## 5. 收益与代价
+## 7. 收益与代价
 
 **收益**
-- 量化容量规划：cache usage 高 → 加显存/降并发；waiting 高 → 加副本。
-- SLO 治理：TTFT/TPOT 直接对应用户体验。
-- 问题定位：命中率低 → 查 prefix 配置；running 少 + iteration tokens 低 → GPU 空转，该上 spec decode/cudagraph。
+- 量化容量规划：KV 使用率高 → 加显存/降并发；waiting 高 → 加副本。
+- SLO 治理：TTFT / ITL 直接对应用户体验，且能按排队/prefill/decode 分解归因。
+- 问题定位：命中率低 → 查前缀配置；running 少且 iteration tokens 低 → GPU 空转。
 
 **代价 / 注意点**
-- 指标本身有采样与聚合开销（小，可忽略）。
-- `time_per_output_token_seconds` 口径易误读，需结合文档理解。
-- Prometheus 端点需独立暴露端口并配 scrape，否则指标采集不到。
-- 多副本/多 DP 下指标需按副本聚合，单副本数字不代表全局。
+- 指标本身有采样与聚合开销（很小，可忽略）。
+- 口径易误读：近似 TPOT 与 ITL 不是一回事；命中率要自己相除（§4.5）。
+- 多副本 / DP 下要按副本聚合，单个副本的数字不代表全局。
+- 部分指标默认不启用（如 `corrupted_requests` 需要开启 NaN 检测，块生命周期类指标需要开启 KV events）。
 
 ---
 
-## 6. 面试高频问题
+## 8. 面试高频问题（速查，理解原理可跳过）
 
-**Q1：vLLM V1 的指标数据采集链路？**
-A：Worker 产出 `ModelRunnerOutput` → EngineCore 汇总成 `SchedulerStats`/`EngineCoreMetrics` → 随 `EngineCoreOutput` 经 ZMQ 回前端 → `StatLoggerBase` 派生 logger 落日志或 Prometheus。
+> 这一节是面试向的 Q&A 速查。**如果目标是能定位线上问题，读完 §1~§5 就够了。**
 
-**Q2：num_requests_waiting 高说明什么？怎么处理？**
-A：说明请求在排队，吞吐或并发上限不足。处理：提高 `max_num_seqs`/`max_num_batched_tokens`、加 DP 副本、或降低单请求显存占用（如降 prefix 缓存保留）。
+**Q1：vLLM V1 的指标采集链路是怎样的？**
+A：EngineCore 每步把 `SchedulerStats` 和 `EngineCoreMetrics` 塞进 `EngineCoreOutputs`，经 ZMQ 回传前端（见 `02`）；前端 `OutputProcessor` 把数据喂给配置的 logger：`LoggingStatLogger` 打周期日志，`PrometheusStatLogger` 暴露 `/metrics`。
 
-**Q3：gpu_cache_usage_perc 接近 1 会怎样？**
-A：KV cache 打满，新请求分配不到 block，触发抢占（RECOMPUTE，见 `05`），已 running 请求被踢重算，尾延迟飙升。
+**Q2：日志里那一行 `Waiting` 是什么？和 `Deferred` 有什么区别？**
+A：`Waiting` 是 `num_waiting_reqs + num_skipped_waiting_reqs` 的和（[loggers.py:268-271](../vllm/v1/metrics/loggers.py#L268)）。`Deferred` 只在 `num_skipped_waiting_reqs > 0` 时打印，指被**瞬时约束**（grammar 未编译完、远程 KV 未到、streaming 输入未到等）推迟的请求，它们不占容量但也没在跑（见 `05`）。
 
-**Q4：gpu_prefix_cache_hit_rate 低但预期很高，可能原因？**
-A：prompt 含随机因素（随机 few-shot 顺序）导致前缀不一致；block_size 过大浪费；或 LoRA 不同 adapter 前缀被隔离。查 prompt 构造与 `enable_prefix_caching` 开关。
+**Q3：怎么判断系统是"容量不够"还是"GPU 空转"？**
+A：容量不够的特征是 `num_requests_waiting` 持续高且 `kv_cache_usage_perc` 接近 1；GPU 空转的特征是 `num_requests_running` 小、`iteration_tokens_total` 低，但 KV 使用率并不高。前者加副本/降并发，后者开异步调度或投机解码。
 
-**Q5：time_per_output_token_seconds 的真实口径？**
-A：它是「e2e 延迟 / 输出 token 数」的近似，并非严格逐 token 间隔，看板时要按文档理解，别当纯 decode 间隔。
+**Q4：TTFT 高怎么定位？**
+A：用延迟分解指标：`request_queue_time_seconds` 大 → 排队，扩容；`request_prefill_time_seconds` 大 → 算得慢，查前缀命中率与 chunked prefill 配置。两者都小但 TTFT 仍高，就要看前端的 tokenize / 多模态预处理（见 `02`）。
 
-**Q6：怎么判断该上投机解码？**
-A：看 `num_requests_running` 小、`iteration_tokens_total` 低（batch 小、GPU 带宽受限、decode 慢），且输出长、draft 与 target 分布接近 → spec decode 收益大（见 `07`）。
+**Q5：`request_time_per_output_token_seconds` 能当 TPOT 用吗？**
+A：它是「端到端延迟 ÷ 输出 token 数」的近似口径，把排队时间也摊进去了，严格来说不是逐 token 间隔。想看生成过程是否流畅，用 `vllm:inter_token_latency_seconds`。
 
-**Q7：Prometheus 指标在哪暴露？**
-A：`PrometheusStatLogger` 配合 API server 的 `/metrics` 路由（[vllm/entrypoints/metrics.py](../vllm/entrypoints/metrics.py)），由 Prometheus 抓取。
-
-**Q8：LoggingStatLogger 打哪些关键数？**
-A：running/waiting 数、GPU 生成吞吐（tok/s）、前缀命中率、调度延迟、cache 使用率（[vllm/v1/metrics/loggers.py:99](../vllm/v1/metrics/loggers.py#L99)）。
-
-**Q9：缓存命中率类指标对容量规划有什么用？**
-A：命中率低意味着大量重复 prefill，可通过加大 prefix 缓存、统一 system prompt、合并相同文档来提升，直接降 TTFT 与 GPU 负载。
-
-**Q10：spec decode 相关的可观测指标？**
-A：草稿接受率（`num_accepted_tokens / num_draft_tokens`）、接受长度分布，来自 `vllm/v1/spec_decode/metrics.py`，用于判断是否该调 `num_speculative_tokens` 或关掉（见 `07`）。
+**Q6：怎么确认前缀缓存真的在省算力？**
+A：两个角度：命中率 `prefix_cache_hits / prefix_cache_queries`；以及更直观的 `prompt_tokens_cached / prompt_tokens`（有多少 prefill token 是靠缓存跳过的）。
 
 ---
 
-## 7. 延伸阅读
+## 9. 延伸阅读
 
-- 实现：`vllm/v1/metrics/loggers.py`、`stats.py`、`prometheus.py`、`vllm/entrypoints/metrics.py`
-- 配合：`04-prefix-caching.md`、`05-scheduler-continuous-batching.md`、`07-speculative-decoding.md`
-- 官方：https://docs.vllm.ai/en/latest/serving/metrics.html
+- 源码：`vllm/v1/metrics/loggers.py`（指标定义与日志格式）、`vllm/v1/metrics/stats.py`（统计结构）、`vllm/v1/metrics/prometheus.py`
+- 投机解码指标：`vllm/v1/spec_decode/metrics.py`（接受率的 PromQL 写法在源码注释里）
+- 官方：https://docs.vllm.ai/en/latest/design/metrics.html
+- 配套阅读：`05-scheduler-continuous-batching.md`（running/waiting/抢占的含义）、`03-paged-attention-kv-cache.md`（KV 使用率怎么算）、`04-prefix-caching.md`（命中率）

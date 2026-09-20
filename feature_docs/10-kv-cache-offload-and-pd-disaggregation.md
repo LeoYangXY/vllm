@@ -2,7 +2,20 @@
 
 > 适用版本：vLLM V1。抽象在 `vllm/distributed/kv_transfer/kv_connector/v1/base.py`，注入点在 `vllm/v1/worker/kv_connector_model_runner_mixin.py`，调度协同在 `vllm/v1/core/sched/scheduler.py`，内置实现在 `vllm/distributed/kv_transfer/kv_connector/v1/`。
 
-## 0. TL;DR
+## 0. 部署卡片与 TL;DR
+
+### 0.1 部署卡片
+
+| 项目 | 内容 |
+| --- | --- |
+| **怎么开** | `--kv-transfer-config '{"kv_connector":"<connector 名>","kv_role":"kv_both"}'`。角色三选一：`kv_producer`（只产出 KV，P 实例）/ `kv_consumer`（只消费，D 实例）/ `kv_both`。可用实现见源码目录 `vllm/distributed/kv_transfer/kv_connector/v1/`（含 offloading、mooncake、nixl、lmcache 等） |
+| **怎么确认生效** | 指标 `vllm:external_prefix_cache_queries` / `vllm:external_prefix_cache_hits`（外部命中率同样要自己相除） |
+| **症状 → 调什么** | ① 外部命中恒为 0 → 先查 connector 名与 `kv_role` 是否配对（P/D 两侧要一产一消），再查两端 `block_size` 是否一致；② 开启后延迟反而变差 → 传输带宽成为新瓶颈，确认 P/D 之间是高速互联；③ 显存没省下来 → offload 命中判断不生效，回看 `04` |
+| **一条命令试** | 这类配置需要**成对起实例**（一份 P、一份 D），本地单实例跑不出效果，建议直接跟官方文档的 PD 分离示例 |
+
+> 这是全套文档里**部署成本最高**的一个 feature：它不是"加个参数就变快"，而是引入了一整套实例编排。没有明确的 KV 瓶颈或 PD 干扰问题，先别上。
+
+### 0.2 五句话 TL;DR
 
 - **是什么**：KV Connector 是一套「KV cache 在实例间/介质间传输与卸载」的插件接口。两大用法：①PD 分离（prefill 与 decode 实例解耦、KV 跨实例传输）；②KV offload（把 KV 卸到 CPU/SSD 省显存）。
 - **解决什么**：KV cache 显存是并发上限的瓶颈；PD 不分离时 prefill 长任务会占住 decode 卡、互相干扰；长会话/多轮对话 KV 占显存高。
@@ -144,7 +157,9 @@ load 与 decode forward 的逐层 overlap 是性能关键：decode 跑第 L 层�
 
 ---
 
-## 6. 面试高频问题
+## 6. 面试高频问题（速查，理解原理可跳过）
+
+> 这一节是面试向的 Q&A 速查，答案大多是正文的压缩版。**如果目标是理解系统或排查线上问题，读完 §1~§5 就够了**，不必逐题记忆。
 
 **Q1：KV Connector 解决哪两类问题？**
 A：①PD 分离（prefill/decode 实例解耦、KV 跨实例传输）；②KV offload（KV 卸到 CPU/SSD 省显存）（[vllm/distributed/kv_transfer/kv_connector/v1/base.py:171](../vllm/distributed/kv_transfer/kv_connector/v1/base.py#L171)）。

@@ -2,7 +2,20 @@
 
 > 适用版本：vLLM V1。实现在 `vllm/v1/cudagraph_dispatcher.py`、`vllm/config/compilation.py`、`vllm/compilation/`，以及 `vllm/v1/worker/gpu_model_runner.py` 的捕获流程。
 
-## 0. TL;DR
+## 0. 部署卡片与 TL;DR
+
+### 0.1 部署卡片
+
+| 项目 | 内容 |
+| --- | --- |
+| **怎么开** | 默认走 `-O3`（cudagraph + 全量编译）。回退档位：`-O0`（最保守）/ `-O1` / `-O2`；彻底关闭：`--enforce-eager`；细粒度：`--compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}'` |
+| **怎么确认生效** | 启动日志里出现 `Capturing CUDA graphs` 与 `torch.compile` 相关输出；`--enforce-eager` 下这些都不会出现 |
+| **症状 → 调什么** | ① 启动特别慢、显存吃紧 → `-O1` 或 `cudagraph_mode=PIECEWISE`；② 改了模型代码后报 capture 相关错 → 先 `--enforce-eager` 验证正确性，再开图；③ 小 batch 延迟高 → 确认没落在 `--enforce-eager` 上，并看 `-O3` 是否生效；④ 开 LoRA 后显存明显上涨 → 见 `12` |
+| **一条命令试** | 分别跑 `vllm serve Qwen/Qwen2.5-7B-Instruct -O3` 和 `-O0`，用 **batch=1、短输出** 的请求对比单 token 延迟 |
+
+> 图捕获是"用显存和启动时间换单步延迟"。**生产默认开，调试先关**——排查正确性问题时 `--enforce-eager` 能省掉一大类"只在图里复现"的怪现象。
+
+### 0.2 五句话 TL;DR
 
 - **是什么**：把一整个 decode step 的 CUDA kernel 序列「录制」成一张图，之后只 replay 不重排（消除 CPU launch 开销）；并用 `torch.compile` 做 FX graph 切分与算子融合。
 - **解决什么**：小 batch decode 时，kernel launch + Python/Triton dispatch 开销占比高，GPU 在等 CPU 喂指令；图捕获把这些开销变成一次 replay。
@@ -148,7 +161,9 @@ def dispatch(self, batch_size, is_non_cudagraph_batch=False, ...):
 
 ---
 
-## 6. 面试高频问题
+## 6. 面试高频问题（速查，理解原理可跳过）
+
+> 这一节是面试向的 Q&A 速查，答案大多是正文的压缩版。**如果目标是理解系统或排查线上问题，读完 §1~§5 就够了**，不必逐题记忆。
 
 **Q1：CUDA Graph 为什么能加速 decode？**
 A：把一步的所有 kernel 录成图，之后一次 `replay()` 替代逐 kernel launch + Python dispatch，消除 CPU 喂指令的开销（小 batch 下占比很高）。

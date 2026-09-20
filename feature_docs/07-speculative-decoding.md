@@ -2,7 +2,20 @@
 
 > 适用版本：vLLM V1。核心在 `vllm/v1/spec_decode/`（`metadata.py` / `eagle.py` / `medusa.py` / `ngram_proposer*.py` / `suffix_decoding.py` / `rejection_sampler.py` / `metrics.py`），调度协同在 `vllm/v1/core/sched/scheduler.py`，执行在 `vllm/v1/worker/gpu_model_runner.py`。
 
-## 0. TL;DR
+## 0. 部署卡片与 TL;DR
+
+### 0.1 部署卡片
+
+| 项目 | 内容 |
+| --- | --- |
+| **怎么开** | `--speculative-config '{"method":"ngram","num_speculative_tokens":5}'`（**不需要 draft 模型，最容易试**）；EAGLE：`--speculative-config '{"method":"eagle","model":"<draft-model>","num_speculative_tokens":3}'` |
+| **怎么确认生效** | 日志里出现 spec decode 的接受率统计；Prometheus 接受率 = `rate(vllm:spec_decode_num_accepted_tokens_total[5m]) / rate(vllm:spec_decode_num_draft_tokens_total[5m])` |
+| **症状 → 调什么** | ① 接受率 < 0.5 → 先降 `num_speculative_tokens`（建议 3~5），再考虑换更贴近 target 的 draft 模型；② 高 QPS / 大 batch 下反而变慢 → 用 `disable_by_batch_size` 在 batch 大时自动关闭；③ 显存变紧 → draft 模型和 KV 都要占显存 |
+| **一条命令试** | `vllm serve Qwen/Qwen2.5-7B-Instruct --speculative-config '{"method":"ngram","num_speculative_tokens":5}'`，用**低并发 + 长输出**压测对比开关前后的吞吐 |
+
+> 别在高 QPS 场景盲开：GPU 已经饱和时，draft 会抢算力，verify 的额外开销不划算。先看 `14` 的 `vllm:num_requests_running` 是不是长期打满。
+
+### 0.2 五句话 TL;DR
 
 - **是什么**：用一个小而快的 draft 模型一次「提议」k 个 token，再让 target 模型**一次 forward 并行验证**这 k 个 token；接受最长匹配前缀，拒绝处重采样。
 - **解决什么**：自回归 decode 是 memory-bandwidth-bound，batch 小时 GPU 算力闲置；串行逐 token 解码把延迟卡在「每 token 一次完整 forward」。
@@ -144,7 +157,9 @@ EAGLE 的 draft 是树：不同分支代表不同可能的后续 token。验证�
 
 ---
 
-## 6. 面试高频问题
+## 6. 面试高频问题（速查，理解原理可跳过）
+
+> 这一节是面试向的 Q&A 速查，答案大多是正文的压缩版。**如果目标是理解系统或排查线上问题，读完 §1~§5 就够了**，不必逐题记忆。
 
 **Q1：投机解码为什么不改变输出分布？**
 A：rejection sampling 保证每个位置的边际分布 = target 分布。接受概率 `min(1, p_t/p_d)`，拒绝处按 `max(0, p_t - p_d)` 归一化重采（[vllm/v1/sample/rejection_sampler.py:92](../vllm/v1/sample/rejection_sampler.py#L92)）。

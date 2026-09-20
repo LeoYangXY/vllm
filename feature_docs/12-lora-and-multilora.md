@@ -1,6 +1,19 @@
 # 12. LoRA 与多 LoRA 热插拔服务
 
-## 0. TL;DR
+## 0. 部署卡片与 TL;DR
+
+### 0.1 部署卡片
+
+| 项目 | 内容 |
+| --- | --- |
+| **怎么开** | `--enable-lora --lora-modules name1=/path/to/adapter1 --max-loras 4 --max-lora-rank 16`；请求里用 `"model": "name1"` 指定 adapter |
+| **怎么确认生效** | `GET /v1/models` 会列出 base 模型和所有已加载 adapter；热插拔用 `POST /v1/load_lora_adapter` / `POST /v1/unload_lora_adapter` |
+| **症状 → 调什么** | ① 请求卡在 waiting 不动 → `max_loras` 打满（这是硬上限），调大它；② 加载时报 rank 超限 → 调 `--max-lora-rank`；③ 前缀命中率明显偏低 → prefix caching 会按 adapter 隔离（`04`）；④ 显存上涨 → 每个 slot 都要常驻一份 adapter 权重 |
+| **一条命令试** | `vllm serve Qwen/Qwen2.5-7B-Instruct --enable-lora --lora-modules sql-lora=/data/sql-lora --max-loras 4`，然后用 `"model":"sql-lora"` 发请求 |
+
+> `max_loras` 决定"一个 batch 里最多能同时出现几个不同 adapter"，是**并发度的隐藏上限**。多租户场景下这个值比 `max_num_seqs` 更容易先被打满。
+
+### 0.2 五句话 TL;DR
 
 - **是什么**：vLLM 在一个进程里同时持有上百个 LoRA adapter，让它们共享同一份 base 权重，只把 `A/B` 低秩矩阵按需换入 GPU。
 - **解决什么**：多租户微调服务里"每个租户一份模型"的显存与成本爆炸（8B bf16 底座 16GB，r=16 的 adapter 只有几十 MB，量级差 1000 倍）。
@@ -818,7 +831,9 @@ extra_keys: list[Any] = (
 
 ---
 
-## 6. 面试高频问题
+## 6. 面试高频问题（速查，理解原理可跳过）
+
+> 这一节是面试向的 Q&A 速查，答案大多是正文的压缩版。**如果目标是理解系统或排查线上问题，读完 §1~§5 就够了**，不必逐题记忆。
 
 **Q1：`max_loras`、`max_lora_rank`、`max_cpu_loras` 分别控制什么？**
 

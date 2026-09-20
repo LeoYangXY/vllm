@@ -2,7 +2,20 @@
 
 > 适用版本：vLLM V1。多模态处理在 `vllm/multimodal/`，前端预处理在 `vllm/v1/engine/input_processor.py`，encoder 执行在 `vllm/v1/worker/mm_encoder_model_runner.py`，encoder 缓存管理在 `vllm/v1/core/encoder_cache_manager.py`。
 
-## 0. TL;DR
+## 0. 部署卡片与 TL;DR
+
+### 0.1 部署卡片
+
+| 项目 | 内容 |
+| --- | --- |
+| **怎么开** | 限制单请求媒体数量：`--limit-mm-per-prompt '{"image":4}'`；控制预处理（分辨率等）：`--mm-processor-kwargs '{"max_pixels":1048576}'`；禁止把单个 mm item 切开：`--disable-chunked-mm-input` |
+| **怎么确认生效** | 启动日志会打印各模态的 budget；运行时看 `vllm:num_requests_waiting`，多模态请求被推迟时会明显堆积 |
+| **症状 → 调什么** | ① 大图 / 多图 OOM → 先加 `--limit-mm-per-prompt`，再降分辨率；② 图片请求迟迟不被调度 → encoder 预算被占满（机制见 `05` §3.12）；③ 同一张图反复传却没省算力 → 确认 encoder cache 命中（本文 §2） |
+| **一条命令试** | `vllm serve Qwen/Qwen2.5-VL-7B-Instruct --limit-mm-per-prompt '{"image":2}'`，然后**连续两次问同一张图**，第二次的 TTFT 应明显更低 |
+
+> 多模态请求有两个额外预算：KV 块之外还有 **encoder 预算**。它默认等于 `max_num_batched_tokens`，图大时很容易成为隐性瓶颈。
+
+### 0.2 五句话 TL;DR
 
 - **是什么**：VLM 的图像/视频先经轻量 encoder（ViT 类）得到 embedding，再拼进 LLM 做 prefill。V1 把「encoder 计算」与「LLM 解码」解耦，并用 `EncoderCacheManager` 按 mm_hash 缓存 encoder 输出。
 - **解决什么**：同图在多轮/多次请求中重复出现，重复跑 ViT 是纯浪费；大图 prefill 长时间独占 GPU。
@@ -171,7 +184,9 @@ def execute_model(self, scheduler_output):
 
 ---
 
-## 6. 面试高频问题
+## 6. 面试高频问题（速查，理解原理可跳过）
+
+> 这一节是面试向的 Q&A 速查，答案大多是正文的压缩版。**如果目标是理解系统或排查线上问题，读完 §1~§5 就够了**，不必逐题记忆。
 
 **Q1：EncoderCacheManager 缓存的是什么粒度？**
 A：encoder **embedding**（不是 encoder token）；文本间隔 token 不计入缓存大小（[encoder_cache_manager.py:19](../vllm/v1/core/encoder_cache_manager.py#L19) docstring 明确）。

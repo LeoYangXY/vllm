@@ -2,7 +2,20 @@
 
 > 适用版本：vLLM V1。核心实现在 `vllm/v1/core/kv_cache_utils.py`、`block_pool.py`、`single_type_kv_cache_manager.py`、`kv_cache_manager.py`。
 
-## 0. TL;DR
+## 0. 部署卡片与 TL;DR
+
+### 0.1 部署卡片
+
+| 项目 | 内容 |
+| --- | --- |
+| **怎么开** | **默认已开启**（`enable_prefix_caching` 默认 `True`）。显式写 `--enable-prefix-caching`；要关用 `--no-enable-prefix-caching`；哈希算法 `--prefix-caching-hash-algo builtin\|sha256` |
+| **怎么确认生效** | 日志里周期性打印 `Prefix cache hit rate: XX%`；指标 `vllm:prefix_cache_hits` / `vllm:prefix_cache_queries`（**命中率要自己相除**，没有现成的 rate 指标） |
+| **症状 → 调什么** | ① 命中率 < 20% → 先确认请求真有共同前缀（system prompt 是否在最前面且逐字相同）；② 前缀长但命中块少 → 看 `--block-size`（`03`），块越小对齐越灵活但哈希开销越大；③ 命中率忽高忽低 → 并发高时块被 LRU 驱逐，属正常；④ 不相关请求想隔离 → 请求级 `cache_salt` |
+| **一条命令试** | `vllm serve Qwen/Qwen2.5-7B-Instruct --enable-prefix-caching`，然后**连发两次带同一段长 system prompt 的请求**，第二次 hit rate 应明显上升 |
+
+> 最容易踩的坑：prefix caching 只认 **token 级完全一致**的前缀。`temperature` 不影响命中（KV 只依赖前向），但 system prompt 里夹一个时间戳或随机 id，整段前缀立刻失效。
+
+### 0.2 五句话 TL;DR
 
 - **是什么**：把「相同的前缀 token 序列」算出来的 KV cache 按 block 复用，新请求命中后这段 prefill 直接跳过。
 - **解决什么**：system prompt、多轮对话历史、RAG 同一文档、few-shot、并行/自洽采样等场景下，大量请求前缀完全相同，重复算 prefill 纯浪费算力、拉高 TTFT。
@@ -89,11 +102,11 @@ def find_longest_cache_hit(self, request, num_computed_tokens, ...) -> tuple[int
 
 ### 2.5 与调度器协同
 
-调度器在 `add_request` / `schedule` 时调用这些查询，把命中的前缀块数填进 `Request.num_cached_tokens` / `num_external_computed_tokens`：
+调度器在 `add_request` / `schedule` 时调用这些查询，命中的 token 数直接减少本步需要计算的量（外部命中填进 `num_external_computed_tokens`）：
 
 - 命中 k 个 block → 该请求 prefill 只需算「k×block_size 之后的 token」。
 - 与 chunked prefill 叠加：即使前缀没全命中，长剩余部分也能被切成 chunk（见 `05`）。
-- prefix cache 命中率指标在 `vllm/v1/core/kv_cache_metrics.py` 与 `gpu_model_runner` 中统计，暴露为 `gpu_prefix_cache_hit_rate`（见 `14`）。
+- 命中率由 `vllm:prefix_cache_hits / vllm:prefix_cache_queries` 暴露（**没有现成的 rate 指标，要自己相除**），详见 `14`。
 
 ---
 
@@ -193,7 +206,9 @@ def cache_full_blocks(self, request_id, blocks, num_cached_blocks, ...):
 
 ---
 
-## 6. 面试高频问题
+## 6. 面试高频问题（速查，理解原理可跳过）
+
+> 这一节是面试向的 Q&A 速查，答案大多是正文的压缩版。**如果目标是理解系统或排查线上问题，读完 §1~§5 就够了**，不必逐题记忆。
 
 **Q1：prefix caching 和 PagedAttention 的关系？**
 A：PagedAttention 提供「分页 KV cache + block 引用」的基础设施（见 `03`）；prefix caching 是建在这之上的「按内容 hash 复用 block」的策略。`ref_cnt` 来自 PagedAttention 的 block 机制，prefix caching 复用它实现共享前缀。
@@ -214,7 +229,7 @@ A：n 个请求的 prompt 完全相同，前缀 hash 链一模一样，第一个
 A：取决于「命中前缀 token 数 / 总 prompt token 数」。命中比例越高，prefill 越接近只算剩余 token，TTFT 越低。长 system prompt 场景收益最大。
 
 **Q7：怎么看命中率？指标叫什么？**
-A：`gpu_prefix_cache_hit_rate`，由 `vllm/v1/core/kv_cache_metrics.py` 与 `gpu_model_runner` 统计，经 `vllm/v1/metrics/` 暴露（见 `14`）。
+A：没有现成的 rate 指标，要用 `vllm:prefix_cache_hits / vllm:prefix_cache_queries` 自己算（日志那行 `Prefix cache hit rate` 已经帮你算好了）。想看"实际省了多少计算"，看 `vllm:prompt_tokens_cached / vllm:prompt_tokens`（见 `14`）。
 
 **Q8：和多模态怎么结合？**
 A：block hash 会混入 `mm_hash`（图像/视频的 hash），所以「文本相同但图不同」不会误命中；同一个图的多次请求则命中，避免重复跑 ViT（与 `13` 的 encoder cache 是两层缓存）。

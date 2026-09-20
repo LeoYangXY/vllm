@@ -2,7 +2,20 @@
 
 > 适用版本：vLLM V1。实现在 `vllm/v1/structured_output/`、`vllm/v1/core/sched/scheduler.py`、`vllm/v1/worker/gpu_model_runner.py`。
 
-## 0. TL;DR
+## 0. 部署卡片与 TL;DR
+
+### 0.1 部署卡片
+
+| 项目 | 内容 |
+| --- | --- |
+| **怎么开** | **请求级参数**，无需服务端开关：OpenAI 接口用 `response_format={"type":"json_schema","json_schema":{...}}`；更通用的有 `guided_json` / `guided_regex` / `guided_choice` / `guided_grammar`；后端可用请求字段 `guided_decoding_backend` 指定（默认 `xgrammar`） |
+| **怎么确认生效** | 返回结果能被 `json.loads` 100% 解析；故意给一个不可能满足的 schema 会报错或输出被严格截断（说明 bitmask 真的在起作用） |
+| **症状 → 调什么** | ① 第一个请求特别慢 → grammar 首次编译，可预热或换 `xgrammar`；② 吞吐下降 → 每步多一次 bitmask 应用，属预期；③ 输出被截在半截 JSON → `max_tokens` 太小；④ 后端报错不支持 → 换 `guided_decoding_backend` |
+| **一条命令试** | `curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"...","messages":[...],"response_format":{"type":"json_object"}}'` |
+
+> 收益最大的是 **function calling / 结构化抽取**：把"生成后校验 + 重试"这一整轮往返直接省掉，且解析失败率归零。
+
+### 0.2 五句话 TL;DR
 
 - **是什么**：在采样阶段用「语法/正则/JSON schema」生成的 token bitmask 屏蔽不合法 token，保证每个输出 token 都满足约束，最终结果必然符合格式。
 - **解决什么**：仅靠 prompt 让模型「输出 JSON」不可靠（模型会漏字段、加多余文字、格式错）；function calling / tool use / 表单抽取要求 **100% 可解析**。
@@ -166,7 +179,9 @@ apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits
 
 ---
 
-## 6. 面试高频问题
+## 6. 面试高频问题（速查，理解原理可跳过）
+
+> 这一节是面试向的 Q&A 速查，答案大多是正文的压缩版。**如果目标是理解系统或排查线上问题，读完 §1~§5 就够了**，不必逐题记忆。
 
 **Q1：约束解码为什么比「生成后校验」好？**
 A：约束解码在采样时刻就屏蔽非法 token，输出必然合法，零重试；后校验失败要整段重生成，延迟和成本翻倍且仍可能再失败。

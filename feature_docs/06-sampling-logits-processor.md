@@ -1,12 +1,25 @@
 # 06 · 采样流程与 Logits Processor 深度解析
 
-## 0. TL;DR
+## 0. 部署卡片与 TL;DR
 
-- **是什么**：vLLM V1 把「从 hidden states 到下一个 token」的整条链路拆成三段——`model.compute_logits`（lm_head 投影）、`Sampler.apply_logits_processors`（约束/偏置/惩罚）、`Sampler.sample`（温度 + top-k/top-p/min-p + 随机采样）。
-- **解决什么**：让 min_tokens / logit_bias / bad_words / 惩罚 / grammar bitmask 这些**逐请求异构**的约束，能在**一个 batched `[B, V]` 张量**上完成，而不是退化成 per-request Python 循环。
-- **怎么做**：所有 per-request 参数都被预先摊成 pinned CPU 侧数组 + 按批异步 H2D 的设备张量（`SamplingMetadata`），processor 只维护「行索引 → 稀疏索引张量」，用 `index_put_` / `masked_fill_` 原地改 logits；整个过程零 CPU-GPU 同步。
-- **关键收益**：logits `[B, V]` 永远不离开 GPU（B=256、V=128k、fp32 就是 131 MB）；绝大多数请求走 fast-path（无惩罚 / 无 top-p / 无 logprobs 时直接跳过整段算子）；top-k/top-p 有 FlashInfer / Triton pivot 两条免排序实现。
-- **代价**：processor 的状态维护是「persistent batch + BatchUpdate(added/removed/moved)」的心智负担；per-request seed 会让采样退化成逐请求循环，并强制从 FlashInfer 回落到 native 路径。
+### 0.1 部署卡片
+
+| 项目 | 内容 |
+| --- | --- |
+| **怎么开** | 采样参数基本都是**请求级**的：`temperature` / `top_p` / `top_k` / `min_p` / `min_tokens` / `repetition_penalty` / `frequency_penalty` / `logit_bias` / `bad_words` / `seed`；服务端只有全局默认 `--seed` |
+| **怎么确认生效** | 请求里加 `"logprobs": 5`，返回体会带 top-5 token 及其概率——用它验证温度、惩罚是否真的生效 |
+| **症状 → 调什么** | ① 想复现结果 → 设 `seed`，但注意每个请求用不同 seed 会走慢路径（性能下降）；② 输出重复啰嗦 → `repetition_penalty` 略大于 1（如 1.05）；③ 输出提前截断 → 检查 `min_tokens` 与停止条件的判定顺序（见 `05` §3.11）；④ 吞吐突然下降 → 可能是某些请求带了罕用参数，打破了采样快速路径 |
+| **一条命令试** | `curl http://localhost:8000/v1/completions -H "Content-Type: application/json" -d '{"model":"...","prompt":"...","temperature":0.8,"top_p":0.95,"max_tokens":64,"logprobs":5}'` |
+
+> 采样是**纯请求级**功能，没有服务端开关。真正需要关心的是：哪些参数组合会打破 batched 快速路径，把吞吐拖下来。
+
+### 0.2 五句话 TL;DR
+
+1. **是什么**：从 hidden states 到下一个 token 分三步——`compute_logits`（投影出 `[B, V]` 的 logits）、logits processor（施加惩罚/偏置/语法掩码）、`sample`（温度 + top-k/top-p + 随机采样）。
+2. **解决什么**：每个请求的约束都不一样（有的要惩罚、有的要 JSON 语法、有的有 `min_tokens`），逐个请求用 Python 处理会退化成慢速循环。
+3. **怎么做**：所有 per-request 参数预先摊平成固定形状的张量，processor 只维护"行索引 → 稀疏参数"，在 `[B, V]` 上原地改，全程不回 CPU。
+4. **收益**：logits 张量永远留在 GPU 上（B=256、V=128k 的 fp32 就是 131 MB）；大多数请求走快速路径（无惩罚、无 logprobs 时整段跳过）。
+5. **代价**：per-request `seed` 会让采样退化成逐请求循环；参数越杂，快速路径越难命中。
 
 ---
 
@@ -1555,7 +1568,9 @@ generator 被存进 `InputBatch.generators`（[vllm/v1/worker/gpu_input_batch.py
 
 ---
 
-## 6. 面试高频问题
+## 6. 面试高频问题（速查，理解原理可跳过）
+
+> 这一节是面试向的 Q&A 速查，答案大多是正文的压缩版。**如果目标是理解系统或排查线上问题，读完 §1~§5 就够了**，不必逐题记忆。
 
 **Q1：vLLM V1 里 `compute_logits` 和 `LogitsProcessor` 分别是什么？**
 `model.compute_logits(hidden_states)` 是模型侧的 lm_head 投影（如 [vllm/model_executor/models/llama.py:420](../vllm/model_executor/models/llama.py#L420) 里 `self.logits_processor(self.lm_head, hidden_states)`，那个 `logits_processor` 是 `vllm/model_executor/layers/logits_processor.py` 的层，做 TP 相关的 gather/logits 后处理）。而 V1 的 `LogitsProcessor`（[vllm/v1/sample/logits_processor/interface.py:60](../vllm/v1/sample/logits_processor/interface.py#L60)）是**对已算出的 `[B, V]` logits 做逐请求约束**的插件抽象，由 `Sampler.apply_logits_processors` 调用。两者名字撞车但完全无关。
